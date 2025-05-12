@@ -2,7 +2,6 @@ import { readFileSync } from "fs";
 import * as core from "@actions/core";
 import OpenAI from "openai";
 import { Octokit } from "@octokit/rest";
-import parseDiff, { Chunk, File } from "parse-diff";
 import minimatch from "minimatch";
 
 const GITHUB_TOKEN: string = core.getInput("GITHUB_TOKEN");
@@ -21,6 +20,25 @@ interface PRDetails {
   pull_number: number;
   title: string;
   description: string;
+}
+
+type Diff = {
+  from: string;
+  to: string;
+  diff: string;
+}
+
+function splitDiffByFiles(diff: string): Diff[] {
+  const fileDiffs = diff.split(/^diff --git a\/.+ b\/.+$/gm)
+    .filter(Boolean);
+
+  const headers = [...diff.matchAll(/^diff --git a\/(.+?) b\/(.+?)$/gm)];
+
+  return fileDiffs.map((content, i) => ({
+    from: headers[i][1],
+    to: headers[i][2],
+    diff: `diff --git a/${headers[i][1]} b/${headers[i][2]}\n${content}`
+  }));
 }
 
 async function getPRDetails(): Promise<PRDetails> {
@@ -57,41 +75,39 @@ async function getDiff(
 }
 
 async function analyzeCode(
-  parsedDiff: File[],
+  parsedDiff: Diff[],
   prDetails: PRDetails
 ): Promise<Array<{ body: string; path: string; line: number }>> {
   const comments: Array<{ body: string; path: string; line: number }> = [];
 
-  for (const file of parsedDiff) {
-    if (file.to === "/dev/null") continue; // Ignore deleted files
-    for (const chunk of file.chunks) {
-      const prompt = createPrompt(file, chunk, prDetails);
-      const aiResponse = await getAIResponse(prompt);
-      if (aiResponse) {
-        const newComments = createComment(file, chunk, aiResponse);
-        if (newComments) {
-          comments.push(...newComments);
-        }
+  for (const diff of parsedDiff) {
+    const prompt = createPrompt(diff, prDetails);
+    const aiResponse = await getAIResponse(prompt);
+    if (aiResponse) {
+      const newComments = createComment(diff, aiResponse);
+      if (newComments) {
+        comments.push(...newComments);
       }
     }
   }
   return comments;
 }
 
-function createPrompt(file: File, chunk: Chunk, prDetails: PRDetails): string {
+function createPrompt(diff: Diff, prDetails: PRDetails): string {
   return `Your task is to review pull requests. Instructions:
-- Provide the response in following JSON format:  {"reviews": [{"lineNumber":  <line_number>, "reviewComment": "<review comment>"}]}
-- Do not give positive comments or compliments.
-- Provide comments and suggestions ONLY if there is something to improve, otherwise "reviews" should be an empty array.
+- Provide the response in following JSON format:  {"reviews": [{"lineNumber":  <line_number>, "side": "LEFT|RIGHT", "reviewComment": "<review comment>"}]}
+- The "side" field should be "LEFT" for the original code and "RIGHT" for the new code.
+- Be pragmatic and concise. Do not be pedantic.
 - If something can be improved, please suggest the improvement in the same comment.
-- Be pragmatic and concise.
+- Do not give positive comments or compliments.
+- Remember lines starting with a "+" are new lines, lines starting with "-" are removed lines and lines starting with " " are unchanged lines.
+- ONLY comment on changed lines
+- Provide comments and suggestions ONLY if there is something to improve, otherwise "reviews" should be an empty array.
 - Write the comment in GitHub Markdown format.
 - Use the given description only for the overall context and only comment the code.
-- IMPORTANT: NEVER suggest adding comments to the code.
+- IMPORTANT: NEVER suggest adding comments or documentation to the code.
 
-Review the following code diff in the file "${
-    file.to
-  }" and take the pull request title and description into account when writing the response.
+Take the pull request title and description into account when writing the response.
   
 Pull request title: ${prDetails.title}
 Pull request description:
@@ -103,17 +119,14 @@ ${prDetails.description}
 Git diff to review:
 
 \`\`\`diff
-${chunk.content}
-${chunk.changes
-  // @ts-expect-error - ln and ln2 exists where needed
-  .map((c) => `${c.ln ? c.ln : c.ln2} ${c.content}`)
-  .join("\n")}
+${diff.diff}
 \`\`\`
 `;
 }
 
 async function getAIResponse(prompt: string): Promise<Array<{
   lineNumber: string;
+  side: 'LEFT' | 'RIGHT';
   reviewComment: string;
 }> | null> {
   const queryConfig = {
@@ -149,20 +162,21 @@ async function getAIResponse(prompt: string): Promise<Array<{
 }
 
 function createComment(
-  file: File,
-  chunk: Chunk,
+  diff: Diff,
   aiResponses: Array<{
     lineNumber: string;
+    side: "LEFT" | "RIGHT";
     reviewComment: string;
   }>
 ): Array<{ body: string; path: string; line: number }> {
   return aiResponses.flatMap((aiResponse) => {
-    if (!file.to) {
+    if (!diff.to) {
       return [];
     }
     return {
       body: aiResponse.reviewComment,
-      path: file.to,
+      path: diff.to,
+      side: aiResponse.side,
       line: Number(aiResponse.lineNumber),
     };
   });
@@ -221,18 +235,24 @@ async function main() {
     return;
   }
 
-  const parsedDiff = parseDiff(diff);
+  const diffs = splitDiffByFiles(diff);
 
   const excludePatterns = core
     .getInput("exclude")
-    .split(",")
+    .split("\n")
     .map((s) => s.trim());
 
-  const filteredDiff = parsedDiff.filter((file) => {
+  const filteredDiff = diffs.filter((diff) => {
+    if (diff.to === "/dev/null") return false; // Ignore deleted files
     return !excludePatterns.some((pattern) =>
-      minimatch(file.to ?? "", pattern)
+      minimatch(diff.to ?? "", pattern)
     );
   });
+
+  if (filteredDiff.length === 0) {
+    console.log("No files to analyze");
+    return;
+  }
 
   const comments = await analyzeCode(filteredDiff, prDetails);
   if (comments.length > 0) {
